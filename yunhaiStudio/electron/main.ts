@@ -2,7 +2,7 @@ import { app, BrowserWindow, shell } from "electron";
 import path from "node:path";
 
 const devUrl = process.env.ELECTRON_START_URL;
-const appUrl = devUrl ?? "http://127.0.0.1:8787";
+const appUrl = devUrl ?? "http://127.0.0.1:8799";
 
 function createWindow() {
   const window = new BrowserWindow({

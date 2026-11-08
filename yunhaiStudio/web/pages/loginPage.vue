@@ -16,11 +16,11 @@
       <form class="loginForm" @submit.prevent="login">
         <label class="field">
           <span>账号</span>
-          <input v-model="account" autocomplete="username" placeholder="手机号 / 邮箱" />
+          <input v-model="username" autocomplete="username" placeholder="用户名 / 邮箱" />
         </label>
         <label class="field">
           <span>密码</span>
-          <input v-model="password" type="password" autocomplete="current-password" placeholder="请输入密码" />
+          <input v-model="password" type="password" autocomplete="current-password" placeholder="至少 8 位" />
         </label>
 
         <div class="formRow">
@@ -31,35 +31,64 @@
           <button type="button" class="linkButton">忘记密码？</button>
         </div>
 
+        <p v-if="errorMessage" class="loginError">{{ errorMessage }}</p>
+
         <button class="primaryButton loginButton" type="submit" :disabled="loading">
           {{ loading ? "正在登录…" : "登录" }}
         </button>
       </form>
 
       <div class="loginFooter">
-        <span class="tiny">演示账号：test / test123456</span>
-        <button class="ghostButton" type="button" @click="login">体验演示</button>
+        <span class="tiny">{{ firstUser ? "首次使用，将创建管理员账号" : "还没有账号？输入密码即可自动注册" }}</span>
+        <button class="ghostButton" type="button" :disabled="loading" @click="login">继续</button>
       </div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref } from "vue";
+import { onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 import { api } from "@/api/client";
+import { appState } from "@/lib/store";
 
 const router = useRouter();
-const account = ref("test");
-const password = ref("test123456");
+const username = ref("");
+const password = ref("");
 const remember = ref(true);
 const loading = ref(false);
+const errorMessage = ref("");
+const firstUser = ref(false);
+
+onMounted(async () => {
+  try {
+    const settings = await api.get<{ firstUser: boolean }>("/auth/settings");
+    firstUser.value = settings.firstUser;
+  } catch {
+    firstUser.value = false;
+  }
+});
 
 async function login() {
+  errorMessage.value = "";
   loading.value = true;
   try {
-    await api.post("/auth/login", { account: account.value || "test", password: password.value });
+    const body = { username: username.value.trim(), password: password.value };
+    const result = await api.post<{ user: { id: string; username: string; displayName: string; role: string } }>(
+      firstUser.value ? "/auth/register" : "/auth/login",
+      body,
+    );
+    appState.profile = {
+      id: result.user.id,
+      name: result.user.displayName || result.user.username,
+      handle: `@${result.user.username}`,
+      credits: 0,
+      plan: result.user.role === "admin" ? "管理员" : "专业版",
+      avatar: "",
+    };
     await router.push("/create");
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : "登录失败，请稍后重试";
   } finally {
     loading.value = false;
   }
@@ -195,6 +224,12 @@ async function login() {
 .loginButton {
   height: 42px;
   margin-top: 4px;
+}
+
+.loginError {
+  margin: 0;
+  font-size: 11px;
+  color: #e5484d;
 }
 
 .loginFooter {

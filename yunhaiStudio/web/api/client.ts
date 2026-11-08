@@ -1,16 +1,31 @@
+interface ApiEnvelope<T> {
+  code: number;
+  data: T;
+  msg: string;
+  reason?: string;
+}
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api${path}`, {
+    credentials: "include",
     headers: {
       "Content-Type": "application/json",
       ...(options.headers ?? {}),
     },
     ...options,
   });
-  if (!response.ok) {
-    const message = await response.text();
-    throw new Error(message || `请求失败 (${response.status})`);
+  const text = await response.text();
+  let envelope: ApiEnvelope<T> | null = null;
+  try {
+    envelope = text ? (JSON.parse(text) as ApiEnvelope<T>) : null;
+  } catch {
+    envelope = null;
   }
-  return (await response.json()) as T;
+  if (!response.ok || (envelope && envelope.code !== 0)) {
+    throw new Error(envelope?.msg || text || `请求失败 (${response.status})`);
+  }
+  if (!envelope) return undefined as T;
+  return envelope.data;
 }
 
 export const api = {

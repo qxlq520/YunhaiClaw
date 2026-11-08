@@ -38,19 +38,27 @@ export function showToast(message: string) {
   }, 2200);
 }
 
+interface AuthUser {
+  id: string;
+  username: string;
+  displayName: string;
+  role: string;
+}
+
 export async function initApp() {
   applyTheme(appState.theme);
   try {
-    appState.profile = await api.get<Profile>("/me");
-  } catch {
+    const result = await api.get<{ user: AuthUser }>("/auth/session");
     appState.profile = {
-      id: "local",
-      name: "云海导演",
-      handle: "@yunhai",
-      credits: 9963.73,
-      plan: "专业版",
+      id: result.user.id,
+      name: result.user.displayName || result.user.username,
+      handle: `@${result.user.username}`,
+      credits: 0,
+      plan: result.user.role === "admin" ? "管理员" : "专业版",
       avatar: "",
     };
+  } catch {
+    appState.profile = null;
   } finally {
     appState.ready = true;
   }

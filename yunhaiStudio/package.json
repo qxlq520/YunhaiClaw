@@ -8,14 +8,14 @@
   "scripts": {
     "dev": "concurrently -k -n server,web \"npm:dev:server\" \"npm:dev:web\"",
     "dev:web": "vite",
-    "dev:server": "tsx watch server/index.ts",
+    "dev:server": "npm --prefix backend run dev",
     "build": "vite build && npm run build:electron",
     "build:electron": "esbuild electron/main.ts electron/preload.ts --bundle --platform=node --format=cjs --external:electron --outdir=electron/dist --out-extension:.js=.cjs",
     "preview": "vite preview",
-    "start:server": "tsx server/index.ts",
+    "start:server": "npm --prefix backend run start",
     "desktop": "concurrently -k -n server,web,electron \"npm:dev:server\" \"npm:dev:web\" \"npm:dev:electron\"",
     "dev:electron": "npm run build:electron && wait-on http://localhost:5173 && cross-env ELECTRON_START_URL=http://localhost:5173 electron .",
-    "typecheck": "vue-tsc --noEmit && tsc -p tsconfig.server.json --noEmit"
+    "typecheck": "vue-tsc --noEmit && tsc -p backend/tsconfig.json --noEmit"
   },
   "dependencies": {
     "cors": "^2.8.5",
