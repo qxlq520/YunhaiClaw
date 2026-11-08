@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
-import { userStatusActive } from "@/internal/model/models";
+import { userRoleAdmin, userRoleUser, userStatusActive, userStatusDisabled } from "@/internal/model/models";
 import type { AuthSession, EmailVerificationCode, User } from "@/internal/model/modelsIdentity";
 import type { LoginLog } from "@/internal/model/modelsLoginLog";
 import type { AuthVerification } from "@/internal/model/modelsNotifications";
+import { defaultUserGroupCode } from "@/internal/model/modelsUserGroup";
 import { recordNotFound, Repository, toBool, toIso, toNullableIso } from "./repository";
 import { checkEmailAvailable, lockRegistrationEmail } from "./emailIdentity";
 import { errEmailVerificationCodeInvalid, errProfileAuthorization, errVerificationInvalid } from "./errors";
@@ -421,4 +422,103 @@ export async function resetUserPasswordWithEmailVerification(
 
 export async function deleteExpiredEmailVerificationCodes(repo: Repository, now: string): Promise<void> {
   await repo.db.run('DELETE FROM "email_verification_codes" WHERE "expires_at" <= ? OR "used_at" IS NOT NULL', [now]);
+}
+
+export async function users(repo: Repository): Promise<User[]> {
+  const rows = await repo.db.all<UserRow>(`SELECT ${userColumns} FROM "users" ORDER BY "created_at" DESC`);
+  return rows.map(mapUser);
+}
+
+export async function totalCreditBalance(repo: Repository): Promise<number> {
+  try {
+    const rows = await repo.db.all<{ total: number }>('SELECT COALESCE(SUM("available_microcredits"), 0) AS "total" FROM "credit_accounts"');
+    return Number(rows[0]?.total ?? 0);
+  } catch (error) {
+    // 早期分析库可能没有钱包表；余额卡片是只读增强，不能让总览接口整体不可用。
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("no such table") || message.toLowerCase().includes("does not exist")) return 0;
+    throw error;
+  }
+}
+
+/** group 为空表示不过滤；default 分组同时匹配未分配分组（空编码）的用户。 */
+export async function adminUsers(
+  repo: Repository,
+  keyword: string,
+  role: User["role"],
+  status: User["status"],
+  group: string,
+  limit: number,
+  offset: number,
+): Promise<{ users: User[]; total: number }> {
+  const conditions: string[] = [];
+  const values: (string | number)[] = [];
+  const groupValue = group.trim();
+  if (groupValue === defaultUserGroupCode) {
+    conditions.push(`("user_group" = ? OR "user_group" = '')`);
+    values.push(groupValue);
+  } else if (groupValue !== "") {
+    conditions.push('"user_group" = ?');
+    values.push(groupValue);
+  }
+  const keywordValue = keyword.trim();
+  if (keywordValue !== "") {
+    const pattern = `%${keywordValue.toLowerCase()}%`;
+    conditions.push('(lower("username") LIKE ? OR lower("display_name") LIKE ? OR lower("email") LIKE ?)');
+    values.push(pattern, pattern, pattern);
+  }
+  if (role === userRoleAdmin || role === userRoleUser) {
+    conditions.push('"role" = ?');
+    values.push(role);
+  }
+  if (status === userStatusActive || status === userStatusDisabled) {
+    conditions.push('"status" = ?');
+    values.push(status);
+  }
+  const where = conditions.length ? ` WHERE ${conditions.join(" AND ")}` : "";
+  const totals = await repo.db.all<{ total: number }>(`SELECT COUNT(*) AS "total" FROM "users"${where}`, values);
+  const rows = await repo.db.all<UserRow>(
+    `SELECT ${userColumns} FROM "users"${where} ORDER BY "created_at" DESC LIMIT ? OFFSET ?`,
+    [...values, limit, offset],
+  );
+  return { users: rows.map(mapUser), total: Number(totals[0]?.total ?? 0) };
+}
+
+export async function adminUserReferences(repo: Repository): Promise<User[]> {
+  const rows = await repo.db.all<{ id: string; username: string; display_name: string }>(
+    'SELECT "id", "username", "display_name" FROM "users" ORDER BY "created_at" DESC LIMIT 100',
+  );
+  return rows.map((row) =>
+    mapUser({
+      id: row.id,
+      username: row.username,
+      email: null,
+      phone: null,
+      email_verified_at: null,
+      phone_verified_at: null,
+      display_name: row.display_name,
+      avatar_mode: "",
+      avatar_preset: null,
+      avatar_version: null,
+      role: "",
+      status: "",
+      is_promoter: false,
+      user_group: null,
+      password_hash: null,
+      last_login_at: null,
+      created_at: "",
+      updated_at: "",
+    }),
+  );
+}
+
+export async function activeAdminCountExcluding(repo: Repository, userId: string): Promise<number> {
+  let query = 'SELECT COUNT(*) AS "total" FROM "users" WHERE "role" = ? AND "status" = ?';
+  const values: string[] = [userRoleAdmin, userStatusActive];
+  if (userId !== "") {
+    query += ' AND "id" <> ?';
+    values.push(userId);
+  }
+  const rows = await repo.db.all<{ total: number }>(query, values);
+  return Number(rows[0]?.total ?? 0);
 }

@@ -3704,6 +3704,69 @@ export const tableDefinitions: TableDefinition[] = [
       { name: "idx_drama_jobs_task_id", unique: false, column: "task_id", priority: 1 },
     ],
   },
+  {
+    name: "skill_curation_settings",
+    model: "SkillCurationSetting",
+    columns: [
+      { name: "id", kind: "integer", primaryKey: true, autoIncrement: false, notNull: false, unique: false, default: null },
+      { name: "enabled", kind: "boolean", primaryKey: false, autoIncrement: false, notNull: false, unique: false, default: "false" },
+      { name: "revision", kind: "integer", primaryKey: false, autoIncrement: false, notNull: false, unique: false, default: "0" },
+    ],
+    indexes: [],
+  },
+  {
+    name: "skill_curation_categories",
+    model: "SkillCurationCategory",
+    columns: [
+      { name: "id", kind: "text", primaryKey: true, autoIncrement: false, notNull: false, unique: false, default: null },
+      { name: "root_tag", kind: "text", primaryKey: false, autoIncrement: false, notNull: true, unique: false, default: null },
+      { name: "name", kind: "text", primaryKey: false, autoIncrement: false, notNull: true, unique: false, default: null },
+      { name: "normalized_name", kind: "text", primaryKey: false, autoIncrement: false, notNull: true, unique: false, default: null },
+      { name: "sort_order", kind: "integer", primaryKey: false, autoIncrement: false, notNull: false, unique: false, default: "0" },
+      { name: "enabled", kind: "boolean", primaryKey: false, autoIncrement: false, notNull: false, unique: false, default: "false" },
+    ],
+    indexes: [
+      { name: "idx_curation_category_name", unique: true, column: "root_tag", priority: 1 },
+      { name: "idx_curation_category_name", unique: true, column: "normalized_name", priority: 2 },
+    ],
+  },
+  {
+    name: "skill_curation_assignments",
+    model: "SkillCurationAssignment",
+    columns: [
+      { name: "skill_id", kind: "text", primaryKey: true, autoIncrement: false, notNull: false, unique: false, default: null },
+      { name: "category_id", kind: "text", primaryKey: true, autoIncrement: false, notNull: false, unique: false, default: null },
+    ],
+    indexes: [
+      { name: "idx_skill_curation_assignments_category_id", unique: false, column: "category_id", priority: 1 },
+    ],
+  },
+  {
+    name: "skill_curation_roots",
+    model: "SkillCurationRoot",
+    columns: [
+      { name: "id", kind: "text", primaryKey: true, autoIncrement: false, notNull: false, unique: false, default: null },
+      { name: "name", kind: "text", primaryKey: false, autoIncrement: false, notNull: true, unique: false, default: null },
+      { name: "normalized_name", kind: "text", primaryKey: false, autoIncrement: false, notNull: true, unique: false, default: null },
+      { name: "icon_key", kind: "text", primaryKey: false, autoIncrement: false, notNull: false, unique: false, default: null },
+      { name: "sort_order", kind: "integer", primaryKey: false, autoIncrement: false, notNull: false, unique: false, default: "0" },
+      { name: "enabled", kind: "boolean", primaryKey: false, autoIncrement: false, notNull: false, unique: false, default: "false" },
+    ],
+    indexes: [
+      { name: "idx_skill_curation_roots_normalized_name", unique: true, column: "normalized_name", priority: 1 },
+    ],
+  },
+  {
+    name: "skill_curation_root_assignments",
+    model: "SkillCurationRootAssignment",
+    columns: [
+      { name: "skill_id", kind: "text", primaryKey: true, autoIncrement: false, notNull: false, unique: false, default: null },
+      { name: "root_id", kind: "text", primaryKey: false, autoIncrement: false, notNull: true, unique: false, default: null },
+    ],
+    indexes: [
+      { name: "idx_skill_curation_root_assignments_root_id", unique: false, column: "root_id", priority: 1 },
+    ],
+  },
 ];
 
 export function columnSqlType(kind: ColumnKind, dialect: "sqlite" | "postgres"): string {

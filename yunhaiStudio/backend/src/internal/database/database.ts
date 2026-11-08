@@ -241,6 +241,14 @@ function indexStatements(table: TableDefinition): string[] {
   return statements;
 }
 
+const defaultSkillCurationRoots = [
+  { id: "drama", name: "短剧影视", normalizedName: "短剧影视", iconKey: "film", sortOrder: 10 },
+  { id: "ecommerce", name: "电商营销", normalizedName: "电商营销", iconKey: "shopping-bag", sortOrder: 20 },
+  { id: "creative", name: "创意设计", normalizedName: "创意设计", iconKey: "palette", sortOrder: 30 },
+  { id: "social", name: "社媒内容", normalizedName: "社媒内容", iconKey: "users", sortOrder: 40 },
+  { id: "others", name: "其他", normalizedName: "其他", iconKey: "shapes", sortOrder: 50 },
+];
+
 export async function migrateSchema(db: Database): Promise<void> {
   await db.exec(
     'CREATE TABLE IF NOT EXISTS "schema_migrations" ("version" BIGINT PRIMARY KEY, "name" TEXT NOT NULL, "checksum" TEXT NOT NULL, "applied_at" TEXT NOT NULL)',
@@ -252,6 +260,16 @@ export async function migrateSchema(db: Database): Promise<void> {
     await db.exec(createTableSql(table, db.dialect));
     for (const statement of indexStatements(table)) await db.exec(statement);
   }
+  for (const root of defaultSkillCurationRoots) {
+    await db.run(
+      'INSERT INTO "skill_curation_roots" ("id", "name", "normalized_name", "icon_key", "sort_order", "enabled") VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING',
+      [root.id, root.name, root.normalizedName, root.iconKey, root.sortOrder, true],
+    );
+  }
+  await db.run(
+    'INSERT INTO "skill_curation_settings" ("id", "enabled", "revision") VALUES (?, ?, ?) ON CONFLICT DO NOTHING',
+    [1, false, 0],
+  );
   await db.run('DELETE FROM "schema_migrations" WHERE "version" = ?', [currentSchemaVersion]);
   await db.run('INSERT INTO "schema_migrations" ("version", "name", "checksum", "applied_at") VALUES (?, ?, ?, ?)', [
     currentSchemaVersion,
