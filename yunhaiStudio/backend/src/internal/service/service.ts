@@ -1,253 +1,240 @@
-import { createHash, randomBytes } from "node:crypto";
-import bcrypt from "bcryptjs";
-import { AppError, newId, unauthorized, forbidden, invalidArgument, conflict } from "@/internal/kernel/errors";
-import { codeAccountNotRegistered } from "@/internal/kernel/errorCodes";
+import { AppError, newId } from "@/internal/kernel/errors";
 import type { User } from "@/internal/model/modelsIdentity";
-import { userRoleAdmin, userRoleUser, userStatusActive, userStatusDisabled } from "@/internal/model/models";
-import type { AuthSession } from "@/internal/model/modelsIdentity";
 import type { CanvasProject } from "@/internal/model/modelsProject";
 import type { Task } from "@/internal/model/modelsTask";
 import type { TaskStatus } from "@/internal/model/models";
 import { Repository } from "@/internal/repository/repository";
-import {
-  authSession,
-  createAuthSession,
-  createUser,
-  deleteAuthSession,
-  updateUserLoginTime,
-  userByAccount,
-  userByEmail,
-  userById,
-  userByUsername,
-  userCount,
-} from "@/internal/repository/account";
 import { listCanvasProjects, canvasProject, saveCanvasProject, deleteCanvasProject } from "@/internal/repository/project";
 import { listTasks, taskById, deleteTask, type TaskQuery } from "@/internal/repository/task";
 import { saveSetting, settingsByPrefix } from "@/internal/repository/setting";
+import {
+  Service as AuthService,
+  sessionCookieName as authSessionCookieName,
+  type AuthSessionResult,
+  type AuthUser,
+  type LoginRequest,
+  type PublicAuthSettings,
+  type RegisterRequest,
+} from "@/internal/auth/authService";
+import type { LoginContext } from "@/internal/auth/loginLogs";
+import { createAuthHost } from "./authHost";
 
-export const sessionCookieName = "open_ai_canvas_session";
+export const sessionCookieName = authSessionCookieName;
+export const defaultBrandName = "云海科技";
 
-const sessionMaxAgeSeconds = 30 * 24 * 60 * 60;
+export type { AuthSessionResult, AuthUser, LoginRequest, PublicAuthSettings, RegisterRequest };
 
-const usernamePattern = /^[a-zA-Z0-9_-]{3,32}$/;
-const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-export interface RegisterRequest {
-  username: string;
-  email?: string;
-  displayName?: string;
-  password: string;
-  acceptedTerms?: boolean;
-}
-
-export interface LoginRequest {
-  username: string;
-  password: string;
-  autoRegister?: boolean;
-}
-
-export interface PublicAuthUser {
-  id: string;
-  username: string;
-  email: string;
-  displayName: string;
-  role: User["role"];
-  status: User["status"];
-  avatarMode: string;
-  avatarPreset: string;
-  avatarVersion: string;
-  isPromoter: boolean;
-  userGroup: string;
-  lastLoginAt: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface AuthSessionResult {
-  user: PublicAuthUser;
-  session: string;
-  maxAgeSecs: number;
-}
-
-export interface PublicAuthSettings {
-  firstUser: boolean;
-  registrationEnabled: boolean;
-  emailEnabled: boolean;
-  emailCodeRequired: boolean;
-  emailRequired: boolean;
-  emailVerificationRequired: boolean;
-  linuxDoEnabled: boolean;
-  loginMode: string;
-  agreementTitle: string;
-  agreementContent: string;
-}
-
-function hashToken(token: string): string {
-  return createHash("sha256").update(token).digest("hex");
-}
-
-function randomToken(): string {
-  return randomBytes(32).toString("hex");
-}
-
-export function parseSessionCookie(value: string | undefined): { sessionId: string; token: string } | null {
-  if (!value) return null;
-  const index = value.indexOf(".");
-  if (index < 0) return null;
-  const sessionId = value.slice(0, index).trim();
-  const token = value.slice(index + 1).trim();
-  if (!sessionId || !token) return null;
-  return { sessionId, token };
-}
-
-export function publicAuthUser(user: User): PublicAuthUser {
-  return {
-    id: user.id,
-    username: user.username,
-    email: user.email ?? "",
-    displayName: user.displayName,
-    role: user.role,
-    status: user.status,
-    avatarMode: user.avatarMode,
-    avatarPreset: user.avatarPreset ?? "",
-    avatarVersion: user.avatarVersion ?? "",
-    isPromoter: user.isPromoter,
-    userGroup: user.userGroup,
-    lastLoginAt: user.lastLoginAt,
-    createdAt: user.createdAt,
-    updatedAt: user.updatedAt,
-  };
-}
+export type { LoginContext };
 
 export class Service {
   readonly repo: Repository;
   readonly dataDir: string;
+  readonly auth: AuthService;
 
   constructor(repo: Repository, dataDir: string) {
     this.repo = repo;
     this.dataDir = dataDir;
+    this.auth = new AuthService(
+      repo,
+      createAuthHost({ dataDir, brandName: defaultBrandName }),
+    );
   }
 
   async close(): Promise<void> {
     await this.repo.db.close();
   }
 
-  async publicAuthSettings(): Promise<PublicAuthSettings> {
-    const count = await userCount(this.repo);
-    return {
-      firstUser: count === 0,
-      registrationEnabled: true,
-      emailEnabled: false,
-      emailCodeRequired: false,
-      emailRequired: false,
-      emailVerificationRequired: false,
-      linuxDoEnabled: false,
-      loginMode: "modal",
-      agreementTitle: "",
-      agreementContent: "",
-    };
+  // 认证域方法：实现位于 internal/auth，Service 只做宿主装配。
+  publicAuthSettings(): Promise<PublicAuthSettings> {
+    return this.auth.publicAuthSettings();
   }
 
-  private validatePassword(password: string): void {
-    if (typeof password !== "string" || password.length < 8) throw invalidArgument("密码至少需要 8 位");
-    if (password.length > 128) throw invalidArgument("密码过长");
+  register(req: RegisterRequest): Promise<AuthSessionResult> {
+    return this.auth.register(req);
   }
 
-  async register(request: RegisterRequest): Promise<AuthSessionResult> {
-    const username = (request.username ?? "").trim();
-    if (!usernamePattern.test(username)) throw invalidArgument("用户名需为 3-32 位字母、数字、下划线或短横线");
-    if (request.email && !emailPattern.test(request.email.trim())) throw invalidArgument("邮箱格式不正确");
-    this.validatePassword(request.password);
-
-    const existing = await userByUsername(this.repo, username);
-    if (existing) throw conflict("用户名已被占用");
-    if (request.email) {
-      const emailOwner = await userByEmail(this.repo, request.email.trim().toLowerCase());
-      if (emailOwner) throw conflict("邮箱已被占用");
-    }
-
-    const count = await userCount(this.repo);
-    const now = new Date().toISOString();
-    const user: User = {
-      id: newId(),
-      username,
-      email: request.email ? request.email.trim().toLowerCase() : "",
-      phone: "",
-      emailVerifiedAt: null,
-      phoneVerifiedAt: null,
-      displayName: request.displayName?.trim() || username,
-      avatarMode: "preset",
-      avatarPreset: "",
-      avatarVersion: "",
-      role: count === 0 ? userRoleAdmin : userRoleUser,
-      status: userStatusActive,
-      isPromoter: false,
-      userGroup: "",
-      passwordHash: await bcrypt.hash(request.password, 10),
-      lastLoginAt: now,
-      createdAt: now,
-      updatedAt: now,
-    };
-    await createUser(this.repo, user);
-    return this.createSession(user);
+  login(req: LoginRequest): Promise<AuthSessionResult> {
+    return this.auth.login(req);
   }
 
-  async login(request: LoginRequest): Promise<AuthSessionResult> {
-    const account = (request.username ?? "").trim();
-    if (!account) throw invalidArgument("请输入用户名或邮箱");
-    this.validatePassword(request.password);
-    const user = await userByAccount(this.repo, account);
-    if (!user) {
-      if (request.autoRegister) {
-        throw new AppError({ status: 404, code: codeAccountNotRegistered, reason: "account_not_registered", message: "该账号尚未注册，确认密码后即可创建账号" });
-      }
-      throw unauthorized("用户名、邮箱或密码不正确");
-    }
-    if (user.status === userStatusDisabled) throw forbidden("该账号已被禁用");
-    const matched = await bcrypt.compare(request.password, user.passwordHash ?? "");
-    if (!matched) throw unauthorized("用户名、邮箱或密码不正确");
-    const now = new Date().toISOString();
-    await updateUserLoginTime(this.repo, user.id, now);
-    user.lastLoginAt = now;
-    user.updatedAt = now;
-    return this.createSession(user);
+  loginRateLimitSubject(account: string): Promise<string> {
+    return this.auth.loginRateLimitSubject(account);
   }
 
-  private async createSession(user: User): Promise<AuthSessionResult> {
-    const token = randomToken();
-    const now = new Date();
-    const session: AuthSession = {
-      id: newId(),
-      userId: user.id,
-      tokenHash: hashToken(token),
-      reauthenticatedAt: null,
-      expiresAt: new Date(now.getTime() + sessionMaxAgeSeconds * 1000).toISOString(),
-      createdAt: now.toISOString(),
-      updatedAt: now.toISOString(),
-    };
-    await createAuthSession(this.repo, session);
-    return { user: publicAuthUser(user), session: `${session.id}.${token}`, maxAgeSecs: sessionMaxAgeSeconds };
+  logout(cookieValue: string, context?: LoginContext): Promise<void> {
+    return this.auth.logout(cookieValue, context);
   }
 
-  async logout(cookieValue: string | undefined): Promise<void> {
-    const parsed = parseSessionCookie(cookieValue);
-    if (!parsed) return;
-    await deleteAuthSession(this.repo, parsed.sessionId);
+  currentUser(cookieValue: string): Promise<User> {
+    return this.auth.currentUser(cookieValue);
   }
 
-  async currentUser(cookieValue: string | undefined): Promise<User> {
-    const parsed = parseSessionCookie(cookieValue);
-    if (!parsed) throw unauthorized("请先登录");
-    const session = await authSession(this.repo, parsed.sessionId);
-    if (!session) throw unauthorized("登录状态已失效");
-    if (session.tokenHash !== hashToken(parsed.token)) throw unauthorized("登录状态已失效");
-    if (new Date(session.expiresAt).getTime() <= Date.now()) throw unauthorized("登录状态已过期");
-    const user = await userById(this.repo, session.userId);
-    if (!user) throw unauthorized("登录状态已失效");
-    if (user.status === userStatusDisabled) throw forbidden("该账号已被禁用");
-    return user;
+  publicAuthUser(user: User): Promise<AuthUser> {
+    return this.auth.publicAuthUser(user);
   }
 
+  adminRegistrationSetting(actor: User | null) {
+    return this.auth.adminRegistrationSetting(actor);
+  }
+
+  updateRegistrationSetting(actor: User | null, req: import("@/internal/auth/registration").RegistrationSettingRequest) {
+    return this.auth.updateRegistrationSetting(actor, req);
+  }
+
+  registrationEnabled(): Promise<boolean> {
+    return this.auth.registrationEnabled();
+  }
+
+  registrationAgreement(): Promise<{ title: string; content: string }> {
+    return this.auth.registrationAgreement();
+  }
+
+  sendPasswordResetEmailCode(email: string): Promise<void> {
+    return this.auth.sendPasswordResetEmailCode(email);
+  }
+
+  resetPassword(req: import("@/internal/auth/passwordReset").PasswordResetRequest): Promise<void> {
+    return this.auth.resetPassword(req);
+  }
+
+  adminEmailSetting(actor: User | null) {
+    return this.auth.adminEmailSetting(actor);
+  }
+
+  updateEmailSetting(actor: User | null, req: import("@/internal/auth/email").EmailSettingRequest) {
+    return this.auth.updateEmailSetting(actor, req);
+  }
+
+  emailEnabled(): Promise<boolean> {
+    return this.auth.emailEnabled();
+  }
+
+  sendRegistrationEmailCode(email: string): Promise<void> {
+    return this.auth.sendRegistrationEmailCode(email);
+  }
+
+  verifyRegistrationEmailCode(email: string, code: string) {
+    return this.auth.verifyRegistrationEmailCode(email, code);
+  }
+
+  adminEmailLogs(
+    actor: User | null,
+    query: import("@/internal/auth/emailAdmin").EmailLogQuery,
+    page: number,
+    pageSize: number,
+  ) {
+    return this.auth.adminEmailLogs(actor, query, page, pageSize);
+  }
+
+  sendTestEmail(actor: User | null, recipient: string): Promise<void> {
+    return this.auth.sendTestEmail(actor, recipient);
+  }
+
+  cleanupEmailLogs(): Promise<number> {
+    return this.auth.cleanupEmailLogs();
+  }
+
+  adminVerificationPolicy(actor: User | null) {
+    return this.auth.adminVerificationPolicy(actor);
+  }
+
+  updateVerificationPolicy(actor: User | null, policy: import("@/internal/auth/verificationPolicy").VerificationPolicy) {
+    return this.auth.updateVerificationPolicy(actor, policy);
+  }
+
+  startVerification(actor: User | null, req: import("@/internal/auth/verification").VerificationRequest) {
+    return this.auth.startVerification(actor, req);
+  }
+
+  loginVerification(req: import("@/internal/auth/verification").VerificationConfirm) {
+    return this.auth.loginVerification(req);
+  }
+
+  bindVerification(actor: User | null, req: import("@/internal/auth/verification").VerificationConfirm) {
+    return this.auth.bindVerification(actor, req);
+  }
+
+  adminLinuxDOSetting(actor: User | null) {
+    return this.auth.adminLinuxDOSetting(actor);
+  }
+
+  updateLinuxDOSetting(actor: User | null, req: import("@/internal/auth/linuxdo").LinuxDOSettingRequest) {
+    return this.auth.updateLinuxDOSetting(actor, req);
+  }
+
+  linuxDOEnabled(): Promise<boolean> {
+    return this.auth.linuxDOEnabled();
+  }
+
+  beginLinuxDOLogin(nextPath: string, acceptedTerms: boolean): Promise<string> {
+    return this.auth.beginLinuxDOLogin(nextPath, acceptedTerms);
+  }
+
+  beginLinuxDOReauthentication(actor: User | null, cookie: string): Promise<string> {
+    return this.auth.beginLinuxDOReauthentication(actor, cookie);
+  }
+
+  linuxDOReauthenticationState(stateValue: string): Promise<boolean> {
+    return this.auth.linuxDOReauthenticationState(stateValue);
+  }
+
+  completeLinuxDOLogin(stateValue: string, code: string, cookieValue: string, context?: LoginContext) {
+    return this.auth.completeLinuxDOLogin(stateValue, code, cookieValue, context);
+  }
+
+  adminLibTVSetting(actor: User | null) {
+    return this.auth.adminLibTVSetting(actor);
+  }
+
+  updateLibTVSetting(actor: User | null, req: import("@/internal/auth/libtv").LibTVSettingRequest) {
+    return this.auth.updateLibTVSetting(actor, req);
+  }
+
+  testLibTV(actor: User | null, projectUuid: string): Promise<void> {
+    return this.auth.testLibTV(actor, projectUuid);
+  }
+
+  importLibTV(userId: string, canvasProjectId: string, projectUuid: string) {
+    return this.auth.importLibTV(userId, canvasProjectId, projectUuid);
+  }
+
+  importTapNow(userId: string, canvasProjectId: string, shareId: string) {
+    return this.auth.importTapNow(userId, canvasProjectId, shareId);
+  }
+
+  userProfile(actor: User | null, cookie: string) {
+    return this.auth.userProfile(actor, cookie);
+  }
+
+  changeProfilePassword(actor: User | null, cookie: string, req: import("@/internal/auth/account").ProfilePasswordRequest) {
+    return this.auth.changeProfilePassword(actor, cookie, req);
+  }
+
+  sendProfileEmailCode(actor: User | null, cookie: string, req: import("@/internal/auth/account").ProfileEmailCodeRequest) {
+    return this.auth.sendProfileEmailCode(actor, cookie, req);
+  }
+
+  changeProfileEmail(actor: User | null, cookie: string, req: import("@/internal/auth/account").ProfileEmailChangeRequest) {
+    return this.auth.changeProfileEmail(actor, cookie, req);
+  }
+
+  updateProfileAvatar(actor: User | null, data: Uint8Array | null) {
+    return this.auth.updateProfileAvatar(actor, data);
+  }
+
+  useDefaultProfileAvatar(actor: User | null) {
+    return this.auth.useDefaultProfileAvatar(actor);
+  }
+
+  selectDefaultProfileAvatar(actor: User | null, preset: string) {
+    return this.auth.selectDefaultProfileAvatar(actor, preset);
+  }
+
+  profileAvatarContent(actor: User | null, targetUserId: string): Promise<Uint8Array> {
+    return this.auth.profileAvatarContent(actor, targetUserId);
+  }
+
+  // 画布与任务域方法：后续按 repository/handler 的迁移节奏扩展。
   async listProjects(user: User): Promise<CanvasProject[]> {
     return listCanvasProjects(this.repo, user.id);
   }
@@ -311,3 +298,4 @@ export class Service {
 }
 
 export type { TaskQuery };
+export { AppError };

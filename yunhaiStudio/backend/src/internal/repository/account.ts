@@ -1,5 +1,14 @@
-import type { AuthSession, User } from "@/internal/model/modelsIdentity";
+import { createHash } from "node:crypto";
+import { userStatusActive } from "@/internal/model/models";
+import type { AuthSession, EmailVerificationCode, User } from "@/internal/model/modelsIdentity";
+import type { LoginLog } from "@/internal/model/modelsLoginLog";
+import type { AuthVerification } from "@/internal/model/modelsNotifications";
 import { recordNotFound, Repository, toBool, toIso, toNullableIso } from "./repository";
+import { checkEmailAvailable, lockRegistrationEmail } from "./emailIdentity";
+import { errEmailVerificationCodeInvalid, errProfileAuthorization, errVerificationInvalid } from "./errors";
+import { insertLoginLog } from "./loginLogs";
+
+export { errProfileAuthorization } from "./errors";
 
 interface UserRow {
   id: string;
@@ -76,6 +85,10 @@ export async function userByEmail(repo: Repository, email: string): Promise<User
 }
 
 export async function createUser(repo: Repository, user: User): Promise<void> {
+  await insertUser(repo, user);
+}
+
+export async function insertUser(repo: Repository, user: User): Promise<void> {
   await repo.db.run(
     `INSERT INTO "users" (${userColumns}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
@@ -150,4 +163,262 @@ export async function requireUser(repo: Repository, id: string): Promise<User> {
   const user = await userById(repo, id);
   if (!user) throw recordNotFound;
   return user;
+}
+
+export async function deleteUserAuthSessions(repo: Repository, userId: string): Promise<void> {
+  await repo.db.run('DELETE FROM "auth_sessions" WHERE "user_id" = ?', [userId]);
+}
+
+export async function deleteExpiredAuthSessions(repo: Repository): Promise<void> {
+  await repo.db.run('DELETE FROM "auth_sessions" WHERE "expires_at" <= ?', [new Date().toISOString()]);
+}
+
+export const profileReauthenticationTtlMs = 5 * 60 * 1000;
+
+export function profileCredentialHash(passwordHash: string): string {
+  return createHash("sha256").update(passwordHash).digest("hex");
+}
+
+async function lockProfileUser(tx: Repository, userId: string): Promise<void> {
+  if (tx.db.dialect === "sqlite") {
+    await tx.db.run('UPDATE "users" SET "updated_at" = "updated_at" WHERE "id" = ?', [userId]);
+  }
+}
+
+/** 会话签发与凭据变更串行化，避免旧凭据校验通过后写入已认证会话。 */
+export async function createAuthSessionForUser(
+  repo: Repository,
+  expected: User,
+  session: AuthSession,
+  events: LoginLog[] = [],
+): Promise<void> {
+  await repo.transaction(async (tx) => {
+    if (session.userId !== expected.id) throw errProfileAuthorization;
+    await lockProfileUser(tx, expected.id);
+    const current = await userById(tx, expected.id);
+    if (!current) throw errProfileAuthorization;
+    if (
+      current.status !== userStatusActive ||
+      (current.passwordHash ?? "") !== (expected.passwordHash ?? "") ||
+      (current.email ?? "") !== (expected.email ?? "")
+    ) {
+      throw errProfileAuthorization;
+    }
+    await createAuthSession(tx, session);
+    for (const event of events) {
+      if (event.userId !== expected.id || event.event !== "login" || event.result !== "success") {
+        throw errProfileAuthorization;
+      }
+      await insertLoginLog(tx, event);
+    }
+  });
+}
+
+async function profileAuthorization(
+  tx: Repository,
+  expected: User,
+  session: AuthSession,
+  _now: string,
+  requireReauth: boolean,
+): Promise<void> {
+  const current = await userById(tx, expected.id);
+  if (!current) throw errProfileAuthorization;
+  if (
+    current.status !== userStatusActive ||
+    (current.passwordHash ?? "") !== (expected.passwordHash ?? "") ||
+    (current.email ?? "") !== (expected.email ?? "")
+  ) {
+    throw errProfileAuthorization;
+  }
+  const stored = await authSession(tx, session.id);
+  if (!stored || stored.userId !== expected.id) throw errProfileAuthorization;
+  // 事务可能等待其他账号写入；取得锁后再检查过期时间。
+  const now = Date.now();
+  if (stored.tokenHash !== session.tokenHash || new Date(stored.expiresAt).getTime() <= now) {
+    throw errProfileAuthorization;
+  }
+  if (requireReauth) {
+    if (!stored.reauthenticatedAt) throw errProfileAuthorization;
+    const reauthenticatedAt = new Date(stored.reauthenticatedAt).getTime();
+    if (reauthenticatedAt > now || reauthenticatedAt + profileReauthenticationTtlMs <= now) {
+      throw errProfileAuthorization;
+    }
+  }
+}
+
+export async function changeProfilePassword(
+  repo: Repository,
+  expected: User,
+  session: AuthSession,
+  newHash: string,
+  now: string,
+): Promise<void> {
+  await repo.transaction(async (tx) => {
+    await lockProfileUser(tx, expected.id);
+    await profileAuthorization(tx, expected, session, now, (expected.passwordHash ?? "") === "");
+    const affected = await tx.db.run(
+      'UPDATE "users" SET "password_hash" = ?, "updated_at" = ? WHERE "id" = ? AND "password_hash" = ? AND "status" = ?',
+      [newHash, now, expected.id, expected.passwordHash ?? "", userStatusActive],
+    );
+    if (affected !== 1) throw errProfileAuthorization;
+    await tx.db.run('DELETE FROM "auth_sessions" WHERE "user_id" = ?', [expected.id]);
+  });
+}
+
+export async function changeProfileEmail(
+  repo: Repository,
+  expected: User,
+  session: AuthSession,
+  verification: AuthVerification,
+  now: string,
+): Promise<void> {
+  await repo.transaction(async (tx) => {
+    await lockRegistrationEmail(tx, verification.email);
+    await profileAuthorization(tx, expected, session, now, (expected.passwordHash ?? "") === "");
+    const current = new Date().toISOString();
+    await checkEmailAvailable(tx, verification.email, expected.id);
+    const consumed = await tx.db.run(
+      'UPDATE "auth_verifications" SET "used_at" = ? WHERE "id" = ? AND "user_id" = ? AND "session_id" = ? AND "purpose" = ? AND "credential_hash" = ? AND "email" = ? AND "ready" = ? AND "used_at" IS NULL AND "expires_at" > ? AND "attempts" <= 5',
+      [
+        current,
+        verification.id,
+        expected.id,
+        session.id,
+        "profile_email",
+        profileCredentialHash(expected.passwordHash ?? ""),
+        verification.email,
+        true,
+        current,
+      ],
+    );
+    if (consumed !== 1) throw errVerificationInvalid;
+    const updated = await tx.db.run(
+      'UPDATE "users" SET "email" = ?, "email_verified_at" = ?, "updated_at" = ? WHERE "id" = ? AND "password_hash" = ? AND "status" = ?',
+      [verification.email ?? "", current, current, expected.id, expected.passwordHash ?? "", userStatusActive],
+    );
+    if (updated !== 1) throw errProfileAuthorization;
+    await tx.db.run('DELETE FROM "auth_sessions" WHERE "user_id" = ?', [expected.id]);
+  });
+}
+
+export async function reauthenticateLinuxDOSession(
+  repo: Repository,
+  expected: User,
+  session: AuthSession,
+  subject: string,
+  now: string,
+): Promise<void> {
+  await repo.transaction(async (tx) => {
+    await lockProfileUser(tx, expected.id);
+    await profileAuthorization(tx, expected, session, now, false);
+    const rows = await tx.db.all<{ total: number }>(
+      'SELECT COUNT(*) AS "total" FROM "user_identities" WHERE "provider" = ? AND "subject" = ? AND "user_id" = ?',
+      ["linuxdo", subject, expected.id],
+    );
+    if (Number(rows[0]?.total ?? 0) !== 1) throw errProfileAuthorization;
+    const affected = await tx.db.run(
+      'UPDATE "auth_sessions" SET "reauthenticated_at" = ?, "updated_at" = ? WHERE "id" = ? AND "user_id" = ? AND "token_hash" = ?',
+      [now, now, session.id, expected.id, session.tokenHash ?? ""],
+    );
+    if (affected !== 1) throw errProfileAuthorization;
+  });
+}
+
+export async function linuxDOReauthenticationState(repo: Repository, stateHash: string): Promise<boolean> {
+  const rows = await repo.db.all<{ reauth_user_id: string | null; reauth_session_id: string | null }>(
+    'SELECT "reauth_user_id", "reauth_session_id" FROM "oauth_states" WHERE "provider" = ? AND "state_hash" = ? LIMIT 1',
+    ["linuxdo", stateHash],
+  );
+  if (!rows.length) return false;
+  return Boolean(rows[0].reauth_user_id) && Boolean(rows[0].reauth_session_id);
+}
+
+export async function latestEmailVerificationCode(
+  repo: Repository,
+  email: string,
+  purpose: string,
+): Promise<EmailVerificationCode | null> {
+  const rows = await repo.db.all<{
+    attempts: number;
+    id: string;
+    email: string;
+    code_hash: string;
+    purpose: string;
+    expires_at: string;
+    used_at: string | null;
+    created_at: string;
+  }>(
+    'SELECT * FROM "email_verification_codes" WHERE "email" = ? AND "purpose" = ? AND "used_at" IS NULL ORDER BY "created_at" DESC LIMIT 1',
+    [email, purpose],
+  );
+  if (!rows.length) return null;
+  const row = rows[0];
+  return {
+    attempts: Number(row.attempts ?? 0),
+    id: row.id,
+    email: row.email,
+    codeHash: row.code_hash,
+    purpose: row.purpose,
+    expiresAt: toIso(row.expires_at),
+    usedAt: toNullableIso(row.used_at),
+    createdAt: toIso(row.created_at),
+  };
+}
+
+export async function markEmailVerificationCodeUsed(repo: Repository, id: string, usedAt: string): Promise<void> {
+  await repo.db.run('UPDATE "email_verification_codes" SET "used_at" = ? WHERE "id" = ? AND "used_at" IS NULL', [usedAt, id]);
+}
+
+export async function deleteEmailVerificationCode(repo: Repository, id: string): Promise<void> {
+  await repo.db.run('DELETE FROM "email_verification_codes" WHERE "id" = ?', [id]);
+}
+
+export async function createUserWithEmailVerification(
+  repo: Repository,
+  user: User,
+  verificationCodeId: string,
+  usedAt: string,
+): Promise<void> {
+  await repo.transaction(async (tx) => {
+    await lockRegistrationEmail(tx, user.email ?? "");
+    await checkEmailAvailable(tx, user.email ?? "", "");
+    const affected = await tx.db.run(
+      'UPDATE "email_verification_codes" SET "used_at" = ? WHERE "id" = ? AND "used_at" IS NULL AND "expires_at" > ?',
+      [usedAt, verificationCodeId, usedAt],
+    );
+    if (affected !== 1) throw new Error("邮箱验证码已失效，请重新获取");
+    await insertUser(tx, user);
+  });
+}
+
+export async function resetUserPasswordWithEmailVerification(
+  repo: Repository,
+  userId: string,
+  email: string,
+  purpose: string,
+  verificationCodeId: string,
+  passwordHash: string,
+  usedAt: string,
+): Promise<void> {
+  await repo.transaction(async (tx) => {
+    const codeAffected = await tx.db.run(
+      'UPDATE "email_verification_codes" SET "used_at" = ? WHERE "id" = ? AND "email" = ? AND "purpose" = ? AND "used_at" IS NULL AND "expires_at" > ?',
+      [usedAt, verificationCodeId, email, purpose, usedAt],
+    );
+    if (codeAffected !== 1) throw errEmailVerificationCodeInvalid;
+    const userAffected = await tx.db.run(
+      'UPDATE "users" SET "password_hash" = ?, "updated_at" = ? WHERE "id" = ? AND "email" <> \'\' AND lower("email") = lower(?) AND "status" = ? AND "password_hash" <> \'\'',
+      [passwordHash, usedAt, userId, email, userStatusActive],
+    );
+    if (userAffected !== 1) throw errEmailVerificationCodeInvalid;
+    await tx.db.run('DELETE FROM "auth_sessions" WHERE "user_id" = ?', [userId]);
+    await tx.db.run(
+      'UPDATE "email_verification_codes" SET "used_at" = ? WHERE "email" = ? AND "purpose" = ? AND "used_at" IS NULL',
+      [usedAt, email, purpose],
+    );
+  });
+}
+
+export async function deleteExpiredEmailVerificationCodes(repo: Repository, now: string): Promise<void> {
+  await repo.db.run('DELETE FROM "email_verification_codes" WHERE "expires_at" <= ? OR "used_at" IS NOT NULL', [now]);
 }
