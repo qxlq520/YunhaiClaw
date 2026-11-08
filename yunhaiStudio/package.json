@@ -1,0 +1,43 @@
+{
+  "name": "yunhai-studio",
+  "version": "0.1.0",
+  "private": true,
+  "description": "云海科技 YunHai 智能影视创作工作台",
+  "type": "module",
+  "main": "electron/dist/main.cjs",
+  "scripts": {
+    "dev": "concurrently -k -n server,web \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:web": "vite",
+    "dev:server": "tsx watch server/index.ts",
+    "build": "vite build && npm run build:electron",
+    "build:electron": "esbuild electron/main.ts electron/preload.ts --bundle --platform=node --format=cjs --external:electron --outdir=electron/dist --out-extension:.js=.cjs",
+    "preview": "vite preview",
+    "start:server": "tsx server/index.ts",
+    "desktop": "concurrently -k -n server,web,electron \"npm:dev:server\" \"npm:dev:web\" \"npm:dev:electron\"",
+    "dev:electron": "npm run build:electron && wait-on http://localhost:5173 && cross-env ELECTRON_START_URL=http://localhost:5173 electron .",
+    "typecheck": "vue-tsc --noEmit && tsc -p tsconfig.server.json --noEmit"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "lucide-vue-next": "^0.468.0",
+    "vue": "^3.5.13",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.2",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "concurrently": "^9.1.0",
+    "cross-env": "^7.0.3",
+    "electron": "^33.2.1",
+    "esbuild": "^0.24.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5",
+    "vue-tsc": "^2.2.0",
+    "wait-on": "^8.0.1"
+  },
+  "trustedDependencies": ["electron", "esbuild"]
+}
